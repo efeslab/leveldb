@@ -5,6 +5,8 @@
 #include "db/db_impl.h"
 
 #include <algorithm>
+#include <iostream>
+#include <fstream>
 #include <set>
 #include <string>
 #include <stdint.h>
@@ -589,7 +591,8 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,const Slice* end) {
 
 Status DBImpl::TEST_CompactMemTable() {
   // NULL batch means just wait for earlier writes to be done
-  Status s = Write(WriteOptions(), NULL);
+  bool dummy;
+  Status s = Write(WriteOptions(), NULL, &dummy);
   if (s.ok()) {
     // Wait until the compaction completes
     MutexLock l(&mutex_);
@@ -1151,15 +1154,18 @@ void DBImpl::ReleaseSnapshot(const Snapshot* s) {
 }
 
 // Convenience methods
-Status DBImpl::Put(const WriteOptions& o, const Slice& key, const Slice& val) {
-  return DB::Put(o, key, val);
+Status DBImpl::Put(const WriteOptions& o, const Slice& key, const Slice& val, bool* is_fsync) {
+  return DB::Put(o, key, val, is_fsync);
 }
 
-Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
-  return DB::Delete(options, key);
+Status DBImpl::Delete(const WriteOptions& options, const Slice& key, bool* is_fsync) {
+  return DB::Delete(options, key, is_fsync);
 }
 
-Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
+/* Flag for calling fsync after compaction starts. */
+bool force_fsync = false;
+
+Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch, bool* is_fsync) {
   Writer w(&mutex_);
   w.batch = my_batch;
   w.sync = options.sync;
@@ -1176,6 +1182,15 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
 
   // May temporarily unlock and wait.
   Status status = MakeRoomForWrite(my_batch == NULL);
+
+  /* (Shaun) Force the write to be an fsync op if compaction has started. */
+  if (force_fsync) {
+    std::cout << "Compaction, calling fsync." << std::endl;
+    w.sync = true;
+    force_fsync = false;
+  }
+  *is_fsync = w.sync;
+
   uint64_t last_sequence = versions_->LastSequence();
   Writer* last_writer = &w;
   if (status.ok() && my_batch != NULL) {  // NULL batch is for compactions
@@ -1191,7 +1206,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
       mutex_.Unlock();
       status = log_->AddRecord(WriteBatchInternal::Contents(updates));
       bool sync_error = false;
-      if (status.ok() && options.sync) {
+
+      /* (Shaun) Changed fsync code. */
+      if (status.ok() && w.sync) {
         status = logfile_->Sync();
         if (!status.ok()) {
           sync_error = true;
@@ -1321,6 +1338,11 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       bg_cv_.Wait();
     } else {
       // Attempt to switch to a new memtable and trigger compaction of old
+
+      // HERE !!!!!!!!!!!!!!!!!!
+      force_fsync = true;
+      // HERE !!!!
+
       assert(versions_->PrevLogNumber() == 0);
       uint64_t new_log_number = versions_->NewFileNumber();
       WritableFile* lfile = NULL;
@@ -1428,16 +1450,23 @@ void DBImpl::GetApproximateSizes(
 
 // Default implementations of convenience methods that subclasses of DB
 // can call if they wish
-Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
+Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value, bool* is_fsync) {
+  // std::ofstream output_file;
+  // output_file.open("/home/shauncl8/temp/output.txt");
+  // output_file << "PUT!!!!" << std::endl;
+  // output_file.close();
+  // std::cout << "calling put" << std::endl;
+
   WriteBatch batch;
   batch.Put(key, value);
-  return Write(opt, &batch);
+  return Write(opt, &batch, is_fsync);
 }
 
-Status DB::Delete(const WriteOptions& opt, const Slice& key) {
+Status DB::Delete(const WriteOptions& opt, const Slice& key, bool* is_fsync) {
+  // std::cout << "calling delete" << std::endl;
   WriteBatch batch;
   batch.Delete(key);
-  return Write(opt, &batch);
+  return Write(opt, &batch, is_fsync);
 }
 
 DB::~DB() { }
